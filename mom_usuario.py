@@ -5,7 +5,8 @@ import json
 import threading
 import time
 from datetime import datetime
-import uuid
+import requests
+from requests.auth import HTTPBasicAuth
 
 
 class RabbitMQCliente:
@@ -20,7 +21,7 @@ class RabbitMQCliente:
         self.consuming = False
 
     def conectar(self, nome_usuario):
-        """Conecta ao RabbitMQ e configura o usuário"""
+        """Conecta ao RabbitMQ apenas se o usuário já existir"""
         try:
             self.connection = pika.BlockingConnection(
                 pika.ConnectionParameters('localhost')
@@ -30,10 +31,24 @@ class RabbitMQCliente:
             self.nome_usuario = nome_usuario
             self.fila_pessoal = f"user_{nome_usuario}"
 
-            # Declarar fila pessoal
-            self.channel.queue_declare(queue=self.fila_pessoal, durable=True)
+            # Verificar se a fila do usuário existe
+            url = "http://localhost:15672/api/queues"
+            response = requests.get(url, auth=HTTPBasicAuth('guest', 'guest'))
+            if response.status_code == 200:
+                filas = [fila['name'] for fila in response.json()]
+                if self.fila_pessoal not in filas:
+                    messagebox.showerror(
+                        "Erro",
+                        f"Usuário '{nome_usuario}' não existe!\n"
+                        "Peça ao administrador para criá-lo no Gerenciador."
+                    )
+                    return False
+            else:
+                messagebox.showerror("Erro", "Não foi possível validar o usuário no RabbitMQ.")
+                return False
 
             self.conectado = True
+            self.carregar_assinaturas_existentes()
             return True
 
         except Exception as e:
@@ -41,7 +56,6 @@ class RabbitMQCliente:
             return False
 
     def desconectar(self):
-        """Desconecta do RabbitMQ"""
         self.consuming = False
         if self.connection and not self.connection.is_closed:
             try:
@@ -50,45 +64,88 @@ class RabbitMQCliente:
                 pass
         self.conectado = False
 
+    def buscar_usuarios_disponiveis(self):
+        """Retorna lista de usuários existentes (filas user_)"""
+        usuarios = []
+        try:
+            url = "http://localhost:15672/api/queues"
+            response = requests.get(url, auth=HTTPBasicAuth('guest', 'guest'))
+            if response.status_code == 200:
+                filas = response.json()
+                for fila in filas:
+                    if fila['name'].startswith("user_"):
+                        usuario = fila['name'].replace("user_", "")
+                        usuarios.append(usuario)
+        except Exception as e:
+            print(f"Erro ao buscar usuários: {e}")
+        return sorted(usuarios)
+
     def assinar_topico(self, nome_topico):
-        """Assina um tópico (exchange)"""
         try:
             if not self.conectado:
                 return False, "Não conectado ao RabbitMQ"
 
-            # Declarar exchange se não existir
-            self.channel.exchange_declare(
-                exchange=nome_topico,
-                exchange_type='fanout',
-                durable=True
-            )
-
-            # Criar fila temporária para o tópico ou usar fila exclusiva
+            self.channel.exchange_declare(exchange=nome_topico, exchange_type='fanout', durable=True)
             fila_topico = f"topic_{nome_topico}_{self.nome_usuario}"
             self.channel.queue_declare(queue=fila_topico, durable=True)
-
-            # Fazer bind da fila com o exchange
-            self.channel.queue_bind(
-                exchange=nome_topico,
-                queue=fila_topico
-            )
+            self.channel.queue_bind(exchange=nome_topico, queue=fila_topico)
 
             self.topicos_assinados.add(nome_topico)
             return True, f"Inscrito no tópico '{nome_topico}'"
-
         except Exception as e:
             return False, f"Erro ao assinar tópico: {e}"
 
+    def desassinar_topico(self, nome_topico):
+        try:
+            fila_topico = f"topic_{nome_topico}_{self.nome_usuario}"
+            self.channel.queue_delete(queue=fila_topico)
+            if nome_topico in self.topicos_assinados:
+                self.topicos_assinados.remove(nome_topico)
+            return True, f"Assinatura do tópico '{nome_topico}' removida."
+        except Exception as e:
+            return False, f"Erro ao desassinar tópico: {e}"
+
+    def buscar_topicos_disponiveis(self):
+        topicos = []
+        try:
+            url = "http://localhost:15672/api/exchanges"
+            response = requests.get(url, auth=HTTPBasicAuth('guest', 'guest'))
+            if response.status_code == 200:
+                exchanges = response.json()
+                for ex in exchanges:
+                    if ex['type'] == 'fanout' and not ex['name'].startswith("amq."):
+                        topicos.append(ex['name'])
+        except Exception as e:
+            print(f"Erro ao buscar tópicos: {e}")
+        return sorted(topicos)
+
+    def carregar_assinaturas_existentes(self):
+        try:
+            url = "http://localhost:15672/api/queues"
+            response = requests.get(url, auth=HTTPBasicAuth('guest', 'guest'))
+            if response.status_code == 200:
+                filas = response.json()
+                for fila in filas:
+                    nome_fila = fila['name']
+                    if nome_fila.startswith("topic_") and nome_fila.endswith(f"_{self.nome_usuario}"):
+                        partes = nome_fila.split("_")
+                        if len(partes) >= 3:
+                            nome_topico = "_".join(partes[1:-1])
+                            self.topicos_assinados.add(nome_topico)
+        except Exception as e:
+            print(f"Erro ao recuperar assinaturas: {e}")
+
     def enviar_mensagem_usuario(self, destinatario, conteudo):
-        """Envia mensagem para outro usuário"""
         try:
             if not self.conectado:
                 return False, "Não conectado ao RabbitMQ"
-
             fila_destinatario = f"user_{destinatario}"
-
-            # Declarar fila do destinatário (caso não exista)
-            self.channel.queue_declare(queue=fila_destinatario, durable=True)
+            url = "http://localhost:15672/api/queues"
+            response = requests.get(url, auth=HTTPBasicAuth('guest', 'guest'))
+            if response.status_code == 200:
+                filas = [fila['name'] for fila in response.json()]
+                if fila_destinatario not in filas:
+                    return False, f"Usuário '{destinatario}' não existe!"
 
             mensagem = {
                 'tipo': 'mensagem_direta',
@@ -97,37 +154,23 @@ class RabbitMQCliente:
                 'conteudo': conteudo,
                 'timestamp': datetime.now().isoformat()
             }
-
             self.channel.basic_publish(
-                exchange='',
-                routing_key=fila_destinatario,
+                exchange='', routing_key=fila_destinatario,
                 body=json.dumps(mensagem),
-                properties=pika.BasicProperties(
-                    delivery_mode=2,  # Tornar mensagem persistente
-                )
+                properties=pika.BasicProperties(delivery_mode=2)
             )
-
             return True, "Mensagem enviada"
-
         except Exception as e:
             return False, f"Erro ao enviar mensagem: {e}"
 
     def enviar_mensagem_topico(self, nome_topico, conteudo):
-        """Envia mensagem para um tópico"""
         try:
             if not self.conectado:
                 return False, "Não conectado ao RabbitMQ"
-
-            # Verificar se exchange existe
             try:
-                self.channel.exchange_declare(
-                    exchange=nome_topico,
-                    exchange_type='fanout',
-                    passive=True
-                )
+                self.channel.exchange_declare(exchange=nome_topico, exchange_type='fanout', passive=True)
             except:
                 return False, f"Tópico '{nome_topico}' não existe"
-
             mensagem = {
                 'tipo': 'mensagem_topico',
                 'topico': nome_topico,
@@ -135,39 +178,25 @@ class RabbitMQCliente:
                 'conteudo': conteudo,
                 'timestamp': datetime.now().isoformat()
             }
-
             self.channel.basic_publish(
-                exchange=nome_topico,
-                routing_key='',
+                exchange=nome_topico, routing_key='',
                 body=json.dumps(mensagem),
-                properties=pika.BasicProperties(
-                    delivery_mode=2,  # Tornar mensagem persistente
-                )
+                properties=pika.BasicProperties(delivery_mode=2)
             )
-
             return True, f"Mensagem enviada para o tópico '{nome_topico}'"
-
         except Exception as e:
             return False, f"Erro ao enviar mensagem para tópico: {e}"
 
     def iniciar_consumo(self, callback_mensagem):
-        """Inicia o consumo de mensagens"""
         if not self.conectado:
             return
-
         self.callback_mensagem = callback_mensagem
         self.consuming = True
-
-        # Thread para consumir mensagens da fila pessoal
         threading.Thread(target=self._consumir_fila_pessoal, daemon=True).start()
-
-        # Thread para consumir mensagens dos tópicos
         threading.Thread(target=self._consumir_topicos, daemon=True).start()
 
     def _consumir_fila_pessoal(self):
-        """Consome mensagens da fila pessoal"""
         try:
-            # Criar nova conexão para o consumer
             consumer_connection = pika.BlockingConnection(
                 pika.ConnectionParameters('localhost')
             )
@@ -179,8 +208,7 @@ class RabbitMQCliente:
                     if self.callback_mensagem:
                         self.callback_mensagem(mensagem)
                     ch.basic_ack(delivery_tag=method.delivery_tag)
-                except Exception as e:
-                    print(f"Erro ao processar mensagem: {e}")
+                except:
                     ch.basic_ack(delivery_tag=method.delivery_tag)
 
             consumer_channel.basic_qos(prefetch_count=1)
@@ -190,20 +218,14 @@ class RabbitMQCliente:
             )
 
             while self.consuming:
-                try:
-                    consumer_connection.process_data_events(time_limit=1)
-                except:
-                    break
+                consumer_connection.process_data_events(time_limit=1)
 
             consumer_connection.close()
-
         except Exception as e:
             print(f"Erro no consumo da fila pessoal: {e}")
 
     def _consumir_topicos(self):
-        """Consome mensagens dos tópicos assinados"""
         try:
-            # Criar nova conexão para o consumer de tópicos
             topic_connection = pika.BlockingConnection(
                 pika.ConnectionParameters('localhost')
             )
@@ -215,11 +237,9 @@ class RabbitMQCliente:
                     if self.callback_mensagem:
                         self.callback_mensagem(mensagem)
                     ch.basic_ack(delivery_tag=method.delivery_tag)
-                except Exception as e:
-                    print(f"Erro ao processar mensagem de tópico: {e}")
+                except:
                     ch.basic_ack(delivery_tag=method.delivery_tag)
 
-            # Configurar consumo para cada tópico assinado
             for topico in self.topicos_assinados:
                 fila_topico = f"topic_{topico}_{self.nome_usuario}"
                 topic_channel.basic_consume(
@@ -228,30 +248,30 @@ class RabbitMQCliente:
                 )
 
             while self.consuming:
-                try:
-                    topic_connection.process_data_events(time_limit=1)
-
-                    # Verificar se há novos tópicos para assinar
-                    for topico in self.topicos_assinados:
-                        fila_topico = f"topic_{topico}_{self.nome_usuario}"
-                        try:
-                            topic_channel.basic_consume(
-                                queue=fila_topico,
-                                on_message_callback=callback
-                            )
-                        except:
-                            pass  # Já está sendo consumido
-                except:
-                    break
+                topic_connection.process_data_events(time_limit=1)
 
             topic_connection.close()
-
         except Exception as e:
             print(f"Erro no consumo de tópicos: {e}")
 
+    def buscar_filas_gerais(self):
+        """Retorna filas que não são de usuários nem de tópicos"""
+        filas = []
+        try:
+            url = "http://localhost:15672/api/queues"
+            response = requests.get(url, auth=HTTPBasicAuth('guest', 'guest'))
+            if response.status_code == 200:
+                for fila in response.json():
+                    nome = fila['name']
+                    if not nome.startswith("user_") and not nome.startswith("topic_") and not nome.startswith("amq."):
+                        filas.append(nome)
+        except Exception as e:
+            print(f"Erro ao buscar filas gerais: {e}")
+        return sorted(filas)
+
 
 class UsuarioGUI:
-    def __init__(self):
+    def __init__(self, nome_usuario=None):
         self.cliente = RabbitMQCliente()
         self.root = tk.Tk()
         self.root.title("MOM Cliente - RabbitMQ")
@@ -259,7 +279,8 @@ class UsuarioGUI:
         self.root.protocol("WM_DELETE_WINDOW", self.fechar_aplicacao)
 
         self.mensagens_recebidas = []
-        self.conectar_usuario()
+        self.filas_consumindo = set()
+        self.conectar_usuario(nome_usuario)
 
         if self.cliente.conectado:
             self.criar_interface()
@@ -268,283 +289,359 @@ class UsuarioGUI:
             self.root.destroy()
             return
 
-    def conectar_usuario(self):
-        """Solicita nome do usuário e conecta"""
+        self.filas_consumindo = set()
+
+    def conectar_usuario(self, nome_usuario=None):
         while True:
-            nome = simpledialog.askstring("Login", "Digite seu nome de usuário:",
-                                          parent=self.root)
+            if nome_usuario is None:
+                nome = simpledialog.askstring("Login", "Digite seu nome de usuário:", parent=self.root)
+            else:
+                nome = nome_usuario
             if not nome:
                 self.root.destroy()
                 return
-
             nome = nome.strip()
             if nome and self.cliente.conectar(nome):
                 self.root.title(f"MOM Cliente - {nome}")
                 break
+            if nome_usuario is not None:
+                self.root.destroy()
+                return
 
     def criar_interface(self):
-        """Cria a interface gráfica do cliente"""
-        # Frame principal
         main_frame = ttk.Frame(self.root, padding="10")
         main_frame.pack(fill=tk.BOTH, expand=True)
 
-        # Título
         titulo = ttk.Label(main_frame, text=f"Cliente MOM RabbitMQ - {self.cliente.nome_usuario}",
                            font=('Arial', 16, 'bold'))
         titulo.pack(pady=(0, 20))
 
-        # Notebook para abas
         notebook = ttk.Notebook(main_frame)
         notebook.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
 
-        # Aba Mensagens
         frame_mensagens = ttk.Frame(notebook)
         notebook.add(frame_mensagens, text="Mensagens Recebidas")
         self.criar_aba_mensagens(frame_mensagens)
 
-        # Aba Enviar para Usuário
+        frame_filas = ttk.Frame(notebook)
+        notebook.add(frame_filas, text="Filas Gerais")
+        self.criar_aba_filas(frame_filas)
+
         frame_usuario = ttk.Frame(notebook)
         notebook.add(frame_usuario, text="Enviar para Usuário")
         self.criar_aba_enviar_usuario(frame_usuario)
 
-        # Aba Tópicos
         frame_topicos = ttk.Frame(notebook)
         notebook.add(frame_topicos, text="Tópicos")
         self.criar_aba_topicos(frame_topicos)
 
-        # Status
         self.status_label = ttk.Label(main_frame, text="Conectado ao RabbitMQ",
                                       foreground="green", font=('Arial', 10))
         self.status_label.pack()
 
     def criar_aba_mensagens(self, parent):
-        """Cria a aba de visualização de mensagens"""
         frame = ttk.Frame(parent, padding="10")
         frame.pack(fill=tk.BOTH, expand=True)
 
-        # Título
-        ttk.Label(frame, text="Mensagens Recebidas",
-                  font=('Arial', 12, 'bold')).pack(anchor=tk.W, pady=(0, 10))
+        ttk.Label(frame, text="Mensagens Recebidas", font=('Arial', 12, 'bold')).pack(anchor=tk.W, pady=(0, 10))
 
-        # Área de mensagens
         frame_mensagens = ttk.Frame(frame)
         frame_mensagens.pack(fill=tk.BOTH, expand=True)
 
-        # Text widget com scrollbar
-        self.text_mensagens = tk.Text(frame_mensagens, wrap=tk.WORD, state=tk.DISABLED,
-                                      font=('Arial', 10))
-        scrollbar_msg = ttk.Scrollbar(frame_mensagens, orient=tk.VERTICAL,
-                                      command=self.text_mensagens.yview)
+        self.text_mensagens = tk.Text(frame_mensagens, wrap=tk.WORD, state=tk.DISABLED, font=('Arial', 10))
+        scrollbar_msg = ttk.Scrollbar(frame_mensagens, orient=tk.VERTICAL, command=self.text_mensagens.yview)
         self.text_mensagens.configure(yscrollcommand=scrollbar_msg.set)
 
         self.text_mensagens.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar_msg.pack(side=tk.RIGHT, fill=tk.Y)
 
-        # Botão limpar
-        ttk.Button(frame, text="Limpar Mensagens",
-                   command=self.limpar_mensagens).pack(pady=(10, 0))
+        ttk.Button(frame, text="Limpar Mensagens", command=self.limpar_mensagens).pack(pady=(10, 0))
 
-    def criar_aba_enviar_usuario(self, parent):
-        """Cria a aba para enviar mensagens para usuários"""
+    def criar_aba_filas(self, parent):
         frame = ttk.Frame(parent, padding="10")
         frame.pack(fill=tk.BOTH, expand=True)
 
-        # Título
-        ttk.Label(frame, text="Enviar Mensagem para Usuário",
-                  font=('Arial', 12, 'bold')).pack(anchor=tk.W, pady=(0, 20))
+        ttk.Label(frame, text="Enviar e Receber de Filas Gerais",
+                  font=('Arial', 12, 'bold')).pack(anchor=tk.W, pady=(0, 10))
 
-        # Campo destinatário
+        ttk.Label(frame, text="Selecione a Fila:").pack(anchor=tk.W)
+        self.combo_filas = ttk.Combobox(frame, state="readonly")
+        self.combo_filas.pack(fill=tk.X, pady=(0, 10))
+        self.atualizar_lista_filas()
+
+        ttk.Button(frame, text="Atualizar Lista de Filas",
+                   command=self.atualizar_lista_filas).pack(pady=(0, 10))
+
+        ttk.Label(frame, text="Mensagem:").pack(anchor=tk.W)
+        self.text_mensagem_fila = tk.Text(frame, height=6, wrap=tk.WORD, font=('Arial', 10))
+        self.text_mensagem_fila.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+
+        ttk.Button(frame, text="Enviar para Fila", command=self.enviar_mensagem_fila).pack(pady=(5, 5))
+        ttk.Button(frame, text="Consumir 1 Mensagem", command=self.consumir_uma_mensagem_fila).pack()
+
+    def criar_aba_enviar_usuario(self, parent):
+        frame = ttk.Frame(parent, padding="10")
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(frame, text="Enviar Mensagem para Usuário", font=('Arial', 12, 'bold')).pack(anchor=tk.W, pady=(0, 20))
+
         ttk.Label(frame, text="Destinatário:").pack(anchor=tk.W)
-        self.entry_destinatario = ttk.Entry(frame, width=50, font=('Arial', 11))
-        self.entry_destinatario.pack(fill=tk.X, pady=(0, 10))
+        self.combo_destinatario = ttk.Combobox(frame, state="readonly", font=('Arial', 11))
+        self.combo_destinatario.pack(fill=tk.X, pady=(0, 10))
+        self.atualizar_lista_usuarios()
 
-        # Campo mensagem
         ttk.Label(frame, text="Mensagem:").pack(anchor=tk.W)
         self.text_mensagem_usuario = tk.Text(frame, height=10, wrap=tk.WORD, font=('Arial', 10))
         self.text_mensagem_usuario.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
 
-        # Botão enviar
-        ttk.Button(frame, text="Enviar Mensagem",
-                   command=self.enviar_mensagem_usuario).pack()
+        ttk.Button(frame, text="Enviar Mensagem", command=self.enviar_mensagem_usuario).pack()
 
     def criar_aba_topicos(self, parent):
-        """Cria a aba de gerenciamento de tópicos"""
         frame = ttk.Frame(parent, padding="10")
         frame.pack(fill=tk.BOTH, expand=True)
 
-        # Seção Assinar Tópico
-        frame_assinar = ttk.LabelFrame(frame, text="Assinar Tópico", padding="10")
-        frame_assinar.pack(fill=tk.X, pady=(0, 20))
+        # Assinaturas
+        frame_assinar = ttk.LabelFrame(frame, text="Gerenciar Assinaturas de Tópicos", padding="10")
+        frame_assinar.pack(fill=tk.BOTH, expand=True, pady=(0, 20))
 
-        ttk.Label(frame_assinar, text="Nome do Tópico:").pack(anchor=tk.W)
-        self.entry_topico_assinar = ttk.Entry(frame_assinar, width=50, font=('Arial', 11))
-        self.entry_topico_assinar.pack(fill=tk.X, pady=(0, 10))
+        self.frame_checkboxes = ttk.Frame(frame_assinar)
+        self.frame_checkboxes.pack(fill=tk.BOTH, expand=True)
 
-        ttk.Button(frame_assinar, text="Assinar Tópico",
-                   command=self.assinar_topico).pack()
+        self.topicos_vars = {}
 
-        # Lista de tópicos assinados
-        ttk.Label(frame_assinar, text="Tópicos Assinados:",
-                  font=('Arial', 10, 'bold')).pack(anchor=tk.W, pady=(10, 5))
+        # Enviar mensagem
+        frame_enviar = ttk.LabelFrame(frame, text="Enviar Mensagem para Tópico", padding="10")
+        frame_enviar.pack(fill=tk.BOTH, expand=True)
 
-        self.listbox_topicos = tk.Listbox(frame_assinar, height=3, font=('Arial', 9))
-        self.listbox_topicos.pack(fill=tk.X, pady=(0, 5))
+        ttk.Label(frame_enviar, text="Selecione o tópico:").pack(anchor=tk.W)
+        self.combo_topicos = ttk.Combobox(frame_enviar, state="readonly")
+        self.combo_topicos.pack(fill=tk.X, pady=(0, 10))
 
-        # Seção Enviar para Tópico
-        frame_enviar_topico = ttk.LabelFrame(frame, text="Enviar Mensagem para Tópico", padding="10")
-        frame_enviar_topico.pack(fill=tk.BOTH, expand=True)
-
-        ttk.Label(frame_enviar_topico, text="Tópico:").pack(anchor=tk.W)
-        self.entry_topico_enviar = ttk.Entry(frame_enviar_topico, width=50, font=('Arial', 11))
-        self.entry_topico_enviar.pack(fill=tk.X, pady=(0, 10))
-
-        ttk.Label(frame_enviar_topico, text="Mensagem:").pack(anchor=tk.W)
-        self.text_mensagem_topico = tk.Text(frame_enviar_topico, height=8, wrap=tk.WORD, font=('Arial', 10))
+        ttk.Label(frame_enviar, text="Mensagem:").pack(anchor=tk.W)
+        self.text_mensagem_topico = tk.Text(frame_enviar, height=6, wrap=tk.WORD, font=('Arial', 10))
         self.text_mensagem_topico.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
 
-        ttk.Button(frame_enviar_topico, text="Enviar para Tópico",
-                   command=self.enviar_mensagem_topico).pack()
+        ttk.Button(frame_enviar, text="Enviar para Tópico", command=self.enviar_mensagem_topico).pack()
+
+        # Agora sim, atualiza os checkboxes e o combobox
+        self.atualizar_checkboxes()
+
+    def atualizar_checkboxes(self):
+        for widget in self.frame_checkboxes.winfo_children():
+            widget.destroy()
+        self.topicos_vars.clear()
+
+        topicos_disponiveis = self.cliente.buscar_topicos_disponiveis()
+        for topico in topicos_disponiveis:
+            var = tk.BooleanVar(value=topico in self.cliente.topicos_assinados)
+            cb = ttk.Checkbutton(self.frame_checkboxes, text=topico, variable=var,
+                                 command=lambda t=topico, v=var: self.toggle_topico(t, v))
+            cb.pack(anchor=tk.W)
+            self.topicos_vars[topico] = var
+
+        # Atualiza combobox com TODOS os tópicos disponíveis
+        self.combo_topicos['values'] = self.cliente.buscar_topicos_disponiveis()
+
+    def toggle_topico(self, nome_topico, var):
+        if var.get():
+            sucesso, msg = self.cliente.assinar_topico(nome_topico)
+            if sucesso:
+                messagebox.showinfo("Sucesso", msg)
+        else:
+            sucesso, msg = self.cliente.desassinar_topico(nome_topico)
+            if sucesso:
+                messagebox.showinfo("Sucesso", msg)
+        self.atualizar_checkboxes()
+
+    def buscar_usuarios_disponiveis(self):
+        """Retorna a lista de usuários existentes (filas user_)"""
+        usuarios = []
+        try:
+            url = "http://localhost:15672/api/queues"
+            response = requests.get(url, auth=HTTPBasicAuth('guest', 'guest'))
+            if response.status_code == 200:
+                filas = response.json()
+                for fila in filas:
+                    if fila['name'].startswith("user_"):
+                        usuario = fila['name'].replace("user_", "")
+                        usuarios.append(usuario)
+        except Exception as e:
+            print(f"Erro ao buscar usuários: {e}")
+        return sorted(usuarios)
+
+    def atualizar_lista_usuarios(self):
+        usuarios = self.cliente.buscar_usuarios_disponiveis()
+        if self.cliente.nome_usuario in usuarios:
+            usuarios.remove(self.cliente.nome_usuario)  # não listar o próprio usuário
+        self.combo_destinatario['values'] = usuarios
 
     def enviar_mensagem_usuario(self):
-        """Envia mensagem para outro usuário"""
-        destinatario = self.entry_destinatario.get().strip()
+        destinatario = self.combo_destinatario.get().strip()
         conteudo = self.text_mensagem_usuario.get('1.0', tk.END).strip()
-
         if not destinatario:
             messagebox.showwarning("Aviso", "Digite o nome do destinatário!")
             return
-
         if not conteudo:
             messagebox.showwarning("Aviso", "Digite uma mensagem!")
             return
-
         sucesso, mensagem = self.cliente.enviar_mensagem_usuario(destinatario, conteudo)
-
         if sucesso:
             messagebox.showinfo("Sucesso", "Mensagem enviada com sucesso!")
             self.text_mensagem_usuario.delete('1.0', tk.END)
-            self.entry_destinatario.delete(0, tk.END)
-        else:
-            messagebox.showerror("Erro", mensagem)
-
-    def assinar_topico(self):
-        """Assina um tópico"""
-        topico = self.entry_topico_assinar.get().strip()
-
-        if not topico:
-            messagebox.showwarning("Aviso", "Digite o nome do tópico!")
-            return
-
-        if topico in self.cliente.topicos_assinados:
-            messagebox.showwarning("Aviso", "Você já está inscrito neste tópico!")
-            return
-
-        sucesso, mensagem = self.cliente.assinar_topico(topico)
-
-        if sucesso:
-            messagebox.showinfo("Sucesso", mensagem)
-            self.entry_topico_assinar.delete(0, tk.END)
-            self.atualizar_lista_topicos()
-
-            # Reiniciar o consumo para incluir o novo tópico
-            self.cliente.consuming = False
-            time.sleep(0.5)
-            self.cliente.iniciar_consumo(self.processar_mensagem_recebida)
+            self.combo_destinatario.set('')
         else:
             messagebox.showerror("Erro", mensagem)
 
     def enviar_mensagem_topico(self):
-        """Envia mensagem para um tópico"""
-        topico = self.entry_topico_enviar.get().strip()
+        topico = self.combo_topicos.get().strip()
         conteudo = self.text_mensagem_topico.get('1.0', tk.END).strip()
-
         if not topico:
-            messagebox.showwarning("Aviso", "Digite o nome do tópico!")
+            messagebox.showwarning("Aviso", "Selecione um tópico para enviar a mensagem!")
             return
-
         if not conteudo:
             messagebox.showwarning("Aviso", "Digite uma mensagem!")
             return
-
         sucesso, mensagem = self.cliente.enviar_mensagem_topico(topico, conteudo)
-
         if sucesso:
-            messagebox.showinfo("Sucesso", "Mensagem enviada para o tópico!")
+            messagebox.showinfo("Sucesso", mensagem)
             self.text_mensagem_topico.delete('1.0', tk.END)
-            self.entry_topico_enviar.delete(0, tk.END)
         else:
             messagebox.showerror("Erro", mensagem)
 
     def processar_mensagem_recebida(self, mensagem):
-        """Processa mensagem recebida do RabbitMQ"""
-
         def atualizar_gui():
             self.mensagens_recebidas.append(mensagem)
             self.exibir_mensagem(mensagem)
-
-        # Executar no thread principal
         self.root.after(0, atualizar_gui)
 
     def exibir_mensagem(self, mensagem):
-        """Exibe uma mensagem na área de texto"""
         self.text_mensagens.config(state=tk.NORMAL)
-
-        # Formatar mensagem
         try:
             timestamp = datetime.fromisoformat(mensagem.get('timestamp', '')).strftime('%H:%M:%S')
         except:
             timestamp = datetime.now().strftime('%H:%M:%S')
-
         tipo = mensagem.get('tipo', 'desconhecido')
-
         if tipo == 'mensagem_topico':
-            # Mensagem de tópico
             topico = mensagem.get('topico', 'Desconhecido')
             remetente = mensagem.get('remetente', 'Desconhecido')
             conteudo = mensagem.get('conteudo', '')
-
             self.text_mensagens.insert(tk.END, f"[{timestamp}] 📢 TÓPICO '{topico}' - {remetente}:\n")
             self.text_mensagens.insert(tk.END, f"{conteudo}\n")
             self.text_mensagens.insert(tk.END, "=" * 60 + "\n\n")
-
         elif tipo == 'mensagem_direta':
-            # Mensagem direta
             remetente = mensagem.get('remetente', 'Desconhecido')
             conteudo = mensagem.get('conteudo', '')
-
             self.text_mensagens.insert(tk.END, f"[{timestamp}] 💬 {remetente}:\n")
             self.text_mensagens.insert(tk.END, f"{conteudo}\n")
             self.text_mensagens.insert(tk.END, "-" * 50 + "\n\n")
-
+        elif tipo == 'mensagem_fila':
+            fila = mensagem.get('fila', 'Desconhecida')
+            remetente = mensagem.get('remetente', 'Desconhecido')
+            conteudo = mensagem.get('conteudo', '')
+            self.text_mensagens.insert(tk.END, f"[{timestamp}] 📦 FILA '{fila}' - {remetente}:\n")
+            self.text_mensagens.insert(tk.END, f"{conteudo}\n")
+            self.text_mensagens.insert(tk.END, "#" * 60 + "\n\n")
         self.text_mensagens.config(state=tk.DISABLED)
         self.text_mensagens.see(tk.END)
 
-    def atualizar_lista_topicos(self):
-        """Atualiza a lista de tópicos assinados"""
-        self.listbox_topicos.delete(0, tk.END)
-        for topico in self.cliente.topicos_assinados:
-            self.listbox_topicos.insert(tk.END, topico)
-
     def limpar_mensagens(self):
-        """Limpa a área de mensagens"""
         self.text_mensagens.config(state=tk.NORMAL)
         self.text_mensagens.delete('1.0', tk.END)
         self.text_mensagens.config(state=tk.DISABLED)
         self.mensagens_recebidas.clear()
 
     def fechar_aplicacao(self):
-        """Fecha a aplicação e desconecta do RabbitMQ"""
         self.cliente.desconectar()
         self.root.destroy()
 
     def executar(self):
-        """Executa a aplicação"""
         if self.cliente.conectado:
-            # Atualizar lista de tópicos inicial
-            self.atualizar_lista_topicos()
             self.root.mainloop()
+
+    def atualizar_lista_filas(self):
+        filas = self.cliente.buscar_filas_gerais()
+        self.combo_filas['values'] = filas
+        if filas:
+            self.combo_filas.current(0)
+
+    def enviar_mensagem_fila(self):
+        fila = self.combo_filas.get().strip()
+        conteudo = self.text_mensagem_fila.get('1.0', tk.END).strip()
+        if not fila:
+            messagebox.showwarning("Aviso", "Selecione uma fila!")
+            return
+        if not conteudo:
+            messagebox.showwarning("Aviso", "Digite uma mensagem!")
+            return
+
+        try:
+            mensagem = {
+                'tipo': 'mensagem_fila',
+                'fila': fila,
+                'remetente': self.cliente.nome_usuario,
+                'conteudo': conteudo,
+                'timestamp': datetime.now().isoformat()
+            }
+            self.cliente.channel.basic_publish(
+                exchange='', routing_key=fila,
+                body=json.dumps(mensagem),
+                properties=pika.BasicProperties(delivery_mode=2)
+            )
+            messagebox.showinfo("Sucesso", f"Mensagem enviada para a fila '{fila}'")
+            self.text_mensagem_fila.delete('1.0', tk.END)
+
+        except Exception as e:
+            messagebox.showerror("Erro", f"Falha ao enviar mensagem: {e}")
+
+    def consumir_fila_geral(self, fila):
+        try:
+            conn = pika.BlockingConnection(pika.ConnectionParameters('localhost'))
+            ch = conn.channel()
+
+            def callback(ch, method, properties, body):
+                try:
+                    mensagem = json.loads(body.decode('utf-8'))
+                    self.root.after(0, lambda: self.processar_mensagem_recebida(mensagem))
+                    ch.basic_ack(delivery_tag=method.delivery_tag)
+                except:
+                    ch.basic_ack(delivery_tag=method.delivery_tag)
+
+            ch.basic_qos(prefetch_count=1)
+            ch.basic_consume(queue=fila, on_message_callback=callback)
+
+            while self.cliente.conectado:
+                conn.process_data_events(time_limit=1)
+
+            conn.close()
+        except Exception as e:
+            print(f"Erro ao consumir fila geral '{fila}': {e}")
+
+    def consumir_uma_mensagem_fila(self):
+        fila = self.combo_filas.get().strip()
+        if not fila:
+            messagebox.showwarning("Aviso", "Selecione uma fila!")
+            return
+        try:
+            conn = pika.BlockingConnection(pika.ConnectionParameters('localhost'))
+            ch = conn.channel()
+
+            method_frame, header_frame, body = ch.basic_get(queue=fila, auto_ack=False)
+            if method_frame:
+                try:
+                    mensagem = json.loads(body.decode('utf-8'))
+                except:
+                    mensagem = {"conteudo": body.decode('utf-8')}
+                self.processar_mensagem_recebida(mensagem)
+                ch.basic_ack(method_frame.delivery_tag)
+            else:
+                messagebox.showinfo("Fila Vazia", f"Não há mensagens na fila '{fila}'.")
+            conn.close()
+        except Exception as e:
+            messagebox.showerror("Erro", f"Falha ao consumir mensagem: {e}")
 
 
 if __name__ == "__main__":
-    app = UsuarioGUI()
+    import sys
+    nome_usuario = sys.argv[1] if len(sys.argv) > 1 else None
+    app = UsuarioGUI(nome_usuario)
     app.executar()
